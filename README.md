@@ -92,11 +92,12 @@ curl -fsSLO "$BASE/SHA256SUMS.txt"
 
 ## Repository Structure & Documentation
 
+- [`CREDITS.md`](./CREDITS.md) · [`NOTICE`](./NOTICE) — Complete third-party data ownership, copyright, academic citations, MIT/MPL/CC0 notices, and trademark disclaimers across all 30 feeds and baseline rule assets
 - [`docs/FORMAT_SPEC.md`](./docs/FORMAT_SPEC.md) — Technical CSV, TXT, DNS RPZ, and `dgmail-rules.json.gz` schema specification
 - [`docs/DATA_POLICY.md`](./docs/DATA_POLICY.md) — Upstream CSIRT/OSINT provenance, shared-hosting subtraction rules, and correction policy
 - [`docs/TERMS.md`](./docs/TERMS.md) — Terms of Use and threat-intelligence operational disclaimer
 - [`docs/PRIVACY.md`](./docs/PRIVACY.md) — Dataset and `https://dgspamguard.daviante.org` API Privacy Policy
 - [`docs/SECURITY.md`](./docs/SECURITY.md) — Vulnerability disclosure and artifact verification guide
-- [`LICENSE`](./LICENSE) — Apache-2.0 (workflows, documentation, and compilation artifacts; upstream open-data attributions in [`docs/DATA_POLICY.md`](./docs/DATA_POLICY.md))
+- [`LICENSE`](./LICENSE) — Apache-2.0 (workflows, documentation, and Daviante compilation work; third-party upstream rights remain with their respective owners per [`CREDITS.md`](./CREDITS.md) and [`NOTICE`](./NOTICE))
 
 Maintained by **Daviante** (`https://daviante.org`) — Contact: `code@daviante.org`.
