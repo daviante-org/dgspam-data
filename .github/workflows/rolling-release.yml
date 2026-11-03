@@ -1,0 +1,223 @@
+name: Rolling Domain, URL & Mail Threat Dataset Release
+
+on:
+  schedule:
+    # Evaluates 15 minutes after each 4-hour UTC snapshot boundary (00:15, 04:15, 08:15, 12:15, 16:15, 20:15 UTC)
+    - cron: "15 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      dgspamguard_api_url:
+        description: "Override DGSPAMGUARD API base URL (defaults to vars.DGSPAMGUARD_API_URL or https://dgspamguard.daviante.org)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: dgspamguard-rolling-release
+  cancel-in-progress: false
+
+jobs:
+  publish-snapshot:
+    name: Fetch, Verify, Publish & Prune DGSPAMGUARD Snapshot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      API_BASE_URL: ${{ inputs.dgspamguard_api_url || vars.DGSPAMGUARD_API_URL || 'https://dgspamguard.daviante.org' }}
+
+    steps:
+      - name: Checkout dgspamguard-data
+        uses: actions/checkout@v7
+
+      - name: Check latest snapshot on DGSPAMGUARD API
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          API="${API_BASE_URL%/}"
+          echo "Querying ${API}/v1/snapshots/latest ..."
+          curl -fsSL --retry 3 --retry-delay 5 "${API}/v1/snapshots/latest" -o /tmp/latest_snapshot.json
+
+          VERSION="$(jq -r '.version // empty' /tmp/latest_snapshot.json)"
+          TITLE="$(jq -r '.release_title // empty' /tmp/latest_snapshot.json)"
+          [[ -z "${TITLE}" ]] && TITLE="${VERSION}"
+
+          if [[ ! "${VERSION}" =~ ^v[0-9]{8}\.[0-9]{4}(\.[0-9]+)?$ ]]; then
+            echo "::error::Unexpected snapshot version format: ${VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "title=${TITLE}" >> "${GITHUB_OUTPUT}"
+
+          if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${VERSION} already exists in ${GITHUB_REPOSITORY}; skipping upload."
+            echo "already_published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "New snapshot ${VERSION} ready for publication."
+            echo "already_published=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Download and verify snapshot artifacts
+        if: steps.check.outputs.already_published == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          API="${API_BASE_URL%/}"
+          OUT_DIR="${RUNNER_TEMP}/release-assets"
+          mkdir -p "${OUT_DIR}"
+
+          jq -r '.release_notes_md' /tmp/latest_snapshot.json > "${OUT_DIR}/RELEASE_NOTES.md"
+
+          jq -r '
+            [
+              .bundle_download_path,
+              .sha256sums_download_path,
+              ("/v1/snapshots/" + .version + "/files/manifest.json"),
+              (.files[].download_path)
+            ] | unique | .[]
+          ' /tmp/latest_snapshot.json > "${OUT_DIR}/ASSET_PATHS.txt"
+
+          while IFS= read -r rel_path; do
+            [[ -z "${rel_path}" ]] && continue
+            fname="$(basename "${rel_path}")"
+            echo "Downloading ${fname} ..."
+            curl -fsSL --retry 3 --retry-delay 5 "${API}${rel_path}" -o "${OUT_DIR}/${fname}"
+          done < "${OUT_DIR}/ASSET_PATHS.txt"
+          rm -f "${OUT_DIR}/ASSET_PATHS.txt"
+
+          # Verify all 9 canonical dataset files + bundle + manifest + SHA256SUMS exist and are non-empty
+          REQUIRED_FILES=(
+            "bundle.tar.gz"
+            "manifest.json"
+            "SHA256SUMS.txt"
+            "dgspamguard-threat-domains.rpz.gz"
+            "dgspamguard-threat-domains.csv.gz"
+            "dgspamguard-threat-domains.txt.gz"
+            "dgspamguard-threat-urls.csv.gz"
+            "dgspamguard-smtp-ips.csv.gz"
+            "dgspamguard-email-domains.csv.gz"
+            "dgspamguard-malware-hashes.csv.gz"
+            "dgspamguard-tld-risk.csv.gz"
+            "dgmail-rules.json.gz"
+          )
+          for req in "${REQUIRED_FILES[@]}"; do
+            if [[ ! -s "${OUT_DIR}/${req}" ]]; then
+              echo "::error::Missing or empty required artifact: ${req}"
+              exit 1
+            fi
+          done
+
+          # Enforce DGMail's 500 KB compressed fetch cap safety ceiling (<= 450,560 bytes / 440 KiB)
+          RULES_BYTES="$(stat -c '%s' "${OUT_DIR}/dgmail-rules.json.gz")"
+          if (( RULES_BYTES > 450560 )); then
+            echo "::error::dgmail-rules.json.gz (${RULES_BYTES} bytes) exceeds 440 KiB ceiling"
+            exit 1
+          fi
+          gunzip -t "${OUT_DIR}/dgmail-rules.json.gz"
+
+          # Verify cryptographic SHA-256 digests and archive structure
+          (
+            cd "${OUT_DIR}"
+            sha256sum -c SHA256SUMS.txt
+            tar -tzf bundle.tar.gz >/dev/null
+          )
+          echo "All 12 release assets verified cleanly."
+
+      - name: Generate keyless OIDC build provenance attestation
+        if: steps.check.outputs.already_published == 'false'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release-assets/bundle.tar.gz
+            ${{ runner.temp }}/release-assets/*.gz
+            ${{ runner.temp }}/release-assets/manifest.json
+            ${{ runner.temp }}/release-assets/SHA256SUMS.txt
+
+      - name: Mint mr-vegapunk GitHub App token
+        if: steps.check.outputs.already_published == 'false'
+        id: vegapunk
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.VEGAPUNK_CLIENT_ID || 'Iv23li4BXFvpVa86toEJ' }}
+          private-key: ${{ secrets.VEGAPUNK_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Publish GitHub Release
+        if: steps.check.outputs.already_published == 'false'
+        env:
+          GH_TOKEN: ${{ steps.vegapunk.outputs.token || secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ steps.check.outputs.version }}"
+          TITLE="${{ steps.check.outputs.title }}"
+          OUT_DIR="${RUNNER_TEMP}/release-assets"
+          NOTES_FILE="${OUT_DIR}/RELEASE_NOTES.md"
+
+          # Create as draft first, upload all verified assets, then publish atomically
+          gh release create "${VER}" \
+            "${OUT_DIR}/bundle.tar.gz" \
+            "${OUT_DIR}/dgspamguard-threat-domains.rpz.gz" \
+            "${OUT_DIR}/dgspamguard-threat-domains.csv.gz" \
+            "${OUT_DIR}/dgspamguard-threat-domains.txt.gz" \
+            "${OUT_DIR}/dgspamguard-threat-urls.csv.gz" \
+            "${OUT_DIR}/dgspamguard-smtp-ips.csv.gz" \
+            "${OUT_DIR}/dgspamguard-email-domains.csv.gz" \
+            "${OUT_DIR}/dgspamguard-malware-hashes.csv.gz" \
+            "${OUT_DIR}/dgspamguard-tld-risk.csv.gz" \
+            "${OUT_DIR}/dgmail-rules.json.gz" \
+            "${OUT_DIR}/manifest.json" \
+            "${OUT_DIR}/SHA256SUMS.txt" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${TITLE}" \
+            --notes-file "${NOTES_FILE}" \
+            --draft
+
+          gh release edit "${VER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --latest
+
+      - name: Mint mr-vegapunk token for 7-day rolling retention cleanup
+        id: vegapunk_prune
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.VEGAPUNK_CLIENT_ID || 'Iv23li4BXFvpVa86toEJ' }}
+          private-key: ${{ secrets.VEGAPUNK_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Prune releases and tags older than 7 days
+        env:
+          GH_TOKEN: ${{ steps.vegapunk_prune.outputs.token || secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUTOFF_ISO="$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "Pruning non-latest releases created before ${CUTOFF_ISO} ..."
+
+          LATEST_TAG="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName -q '.tagName' 2>/dev/null || true)"
+          if [[ -z "${LATEST_TAG}" ]]; then
+            echo "No latest release present yet; nothing to prune."
+            exit 0
+          fi
+
+          gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -r --arg cutoff "${CUTOFF_ISO}" --arg latest "${LATEST_TAG}" '
+                .[]
+                | select(.draft == false)
+                | select(.tag_name != $latest)
+                | select((.published_at // .created_at) < $cutoff)
+                | .tag_name
+              ' \
+            | while IFS= read -r old_tag; do
+                [[ -z "${old_tag}" ]] && continue
+                echo "Deleting expired >7d snapshot release & git tag: ${old_tag}"
+                gh release delete "${old_tag}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag
+              done
