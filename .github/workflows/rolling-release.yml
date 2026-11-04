@@ -2,8 +2,10 @@ name: Rolling Domain, URL & Mail Threat Dataset Release
 
 on:
   schedule:
-    # Evaluates 15 minutes after each 4-hour UTC snapshot boundary (00:15, 04:15, 08:15, 12:15, 16:15, 20:15 UTC)
-    - cron: "15 */4 * * *"
+    # Polls twice per hour on off-peak minutes (:17 and :47 UTC) to avoid GitHub :00/:15 cron
+    # congestion and automatically recover from delayed or dropped ticks after each 4-hour UTC
+    # snapshot boundary (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       dgspamguard_api_url:
@@ -24,7 +26,7 @@ jobs:
   publish-snapshot:
     name: Fetch, Verify, Publish & Prune DGSPAMGUARD Snapshot
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       API_BASE_URL: ${{ inputs.dgspamguard_api_url || vars.DGSPAMGUARD_API_URL || 'https://dgspamguard.daviante.org' }}
@@ -33,62 +35,94 @@ jobs:
       - name: Checkout dgspamguard-data
         uses: actions/checkout@v7
 
-      - name: Check latest snapshot on DGSPAMGUARD API
+      - name: Check pending snapshots on DGSPAMGUARD API
         id: check
         shell: bash
         run: |
           set -euo pipefail
           API="${API_BASE_URL%/}"
-          echo "Querying ${API}/v1/snapshots/latest ..."
-          curl -fsSL --retry 3 --retry-delay 5 "${API}/v1/snapshots/latest" -o /tmp/latest_snapshot.json
+          CURL_META_OPTS=(
+            --fail --silent --show-error --location
+            --connect-timeout 15 --max-time 60
+            --retry 4 --retry-delay 5 --retry-all-errors
+          )
 
-          VERSION="$(jq -r '.version // empty' /tmp/latest_snapshot.json)"
-          TITLE="$(jq -r '.release_title // empty' /tmp/latest_snapshot.json)"
-          [[ -z "${TITLE}" ]] && TITLE="${VERSION}"
+          echo "Querying ${API}/v1/snapshots ..."
+          curl "${CURL_META_OPTS[@]}" "${API}/v1/snapshots" -o /tmp/snapshots_list.json
 
-          if [[ ! "${VERSION}" =~ ^v[0-9]{8}\.[0-9]{4}(\.[0-9]+)?$ ]]; then
-            echo "::error::Unexpected snapshot version format: ${VERSION}"
+          if ! jq -e '.snapshots | type == "array" and length > 0' /tmp/snapshots_list.json >/dev/null; then
+            echo "::error::DGSPAMGUARD API returned no available snapshots."
             exit 1
           fi
 
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "title=${TITLE}" >> "${GITHUB_OUTPUT}"
+          NEWEST_VERSION="$(jq -r '(.active_version // .snapshots[0].version) // empty' /tmp/snapshots_list.json)"
+          if [[ ! "${NEWEST_VERSION}" =~ ^v[0-9]{8}\.[0-9]{4}(\.[0-9]+)?$ ]]; then
+            echo "::error::Unexpected active snapshot version format: ${NEWEST_VERSION}"
+            exit 1
+          fi
 
-          if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Release ${VERSION} already exists in ${GITHUB_REPOSITORY}; skipping upload."
-            echo "already_published=true" >> "${GITHUB_OUTPUT}"
+          echo "Fetching existing releases in ${GITHUB_REPOSITORY} ..."
+          gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -s 'add // []' > /tmp/gh_releases.json
+
+          # Use a 15-minute buffer inside the 7-day retention window so snapshots near expiry
+          # are not uploaded right before pruning.
+          BACKFILL_CUTOFF_ISO="$(date -u -d '10065 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')"
+          BACKFILL_CUTOFF_TAG="$(date -u -d '10065 minutes ago' '+v%Y%m%d.%H%M')"
+
+          # Find all snapshots within the 7-day window that are not yet published (non-draft),
+          # ordered oldest-to-newest so backfills and latest promotion occur chronologically.
+          # Cap at 12 snapshots per run (48h of 4-hour slots) to stay well within disk/time limits.
+          jq -r \
+            --slurpfile rels /tmp/gh_releases.json \
+            --arg cutoff "${BACKFILL_CUTOFF_ISO}" \
+            --arg cutoff_tag "${BACKFILL_CUTOFF_TAG}" \
+            --arg newest "${NEWEST_VERSION}" '
+              ($rels[0] | map(select(.draft == false) | .tag_name)) as $published
+              | [
+                  .snapshots[]
+                  | select(.version | test("^v[0-9]{8}\\.[0-9]{4}(\\.[0-9]+)?$"))
+                  | select(
+                      (.version == $newest)
+                      or (
+                        ((.created_at // "") >= $cutoff)
+                        and (.version[0:14] >= $cutoff_tag)
+                      )
+                    )
+                  | select((.version as $v | ($published | index($v))) == null)
+                ]
+              | sort_by(.created_at, .version)
+              | .[-12:]
+              | .[].version
+            ' /tmp/snapshots_list.json > /tmp/pending_versions.txt
+
+          mapfile -t PENDING < <(grep -v '^[[:space:]]*$' /tmp/pending_versions.txt || true)
+
+          echo "newest_version=${NEWEST_VERSION}" >> "${GITHUB_OUTPUT}"
+          if (( ${#PENDING[@]} == 0 )); then
+            echo "All eligible snapshots (latest: ${NEWEST_VERSION}) already exist in ${GITHUB_REPOSITORY}; skipping upload."
+            echo "has_pending=false" >> "${GITHUB_OUTPUT}"
           else
-            echo "New snapshot ${VERSION} ready for publication."
-            echo "already_published=false" >> "${GITHUB_OUTPUT}"
+            echo "Found ${#PENDING[@]} unpublished snapshot(s) ready for publication: ${PENDING[*]}"
+            echo "has_pending=true" >> "${GITHUB_OUTPUT}"
           fi
 
       - name: Download and verify snapshot artifacts
-        if: steps.check.outputs.already_published == 'false'
+        if: steps.check.outputs.has_pending == 'true'
         shell: bash
         run: |
           set -euo pipefail
           API="${API_BASE_URL%/}"
-          OUT_DIR="${RUNNER_TEMP}/release-assets"
-          mkdir -p "${OUT_DIR}"
-
-          jq -r '.release_notes_md' /tmp/latest_snapshot.json > "${OUT_DIR}/RELEASE_NOTES.md"
-
-          jq -r '
-            [
-              .bundle_download_path,
-              .sha256sums_download_path,
-              ("/v1/snapshots/" + .version + "/files/manifest.json"),
-              (.files[].download_path)
-            ] | unique | .[]
-          ' /tmp/latest_snapshot.json > "${OUT_DIR}/ASSET_PATHS.txt"
-
-          while IFS= read -r rel_path; do
-            [[ -z "${rel_path}" ]] && continue
-            fname="$(basename "${rel_path}")"
-            echo "Downloading ${fname} ..."
-            curl -fsSL --retry 3 --retry-delay 5 "${API}${rel_path}" -o "${OUT_DIR}/${fname}"
-          done < "${OUT_DIR}/ASSET_PATHS.txt"
-          rm -f "${OUT_DIR}/ASSET_PATHS.txt"
+          CURL_META_OPTS=(
+            --fail --silent --show-error --location
+            --connect-timeout 15 --max-time 60
+            --retry 4 --retry-delay 5 --retry-all-errors
+          )
+          CURL_ASSET_OPTS=(
+            --fail --silent --show-error --location
+            --connect-timeout 15 --max-time 180
+            --retry 4 --retry-delay 5 --retry-all-errors
+          )
 
           # Verify all 9 canonical dataset files + bundle + manifest + SHA256SUMS exist and are non-empty
           REQUIRED_FILES=(
@@ -105,41 +139,77 @@ jobs:
             "dgspamguard-tld-risk.csv.gz"
             "dgmail-rules.json.gz"
           )
-          for req in "${REQUIRED_FILES[@]}"; do
-            if [[ ! -s "${OUT_DIR}/${req}" ]]; then
-              echo "::error::Missing or empty required artifact: ${req}"
+
+          mapfile -t PENDING < <(grep -v '^[[:space:]]*$' /tmp/pending_versions.txt || true)
+          for ver in "${PENDING[@]}"; do
+            [[ -z "${ver}" ]] && continue
+            echo "=== Preparing snapshot ${ver} ==="
+            SNAP_DIR="${RUNNER_TEMP}/release-assets/${ver}"
+            ASSET_DIR="${SNAP_DIR}/assets"
+            mkdir -p "${ASSET_DIR}"
+
+            DETAIL_JSON="${SNAP_DIR}/detail.json"
+            curl "${CURL_META_OPTS[@]}" "${API}/v1/snapshots/${ver}" -o "${DETAIL_JSON}"
+
+            TITLE="$(jq -r '.release_title // empty' "${DETAIL_JSON}")"
+            [[ -z "${TITLE}" ]] && TITLE="${ver}"
+            printf '%s\n' "${TITLE}" > "${SNAP_DIR}/TITLE.txt"
+            jq -r '.release_notes_md' "${DETAIL_JSON}" > "${SNAP_DIR}/RELEASE_NOTES.md"
+
+            jq -r '
+              [
+                .bundle_download_path,
+                .sha256sums_download_path,
+                ("/v1/snapshots/" + .version + "/files/manifest.json"),
+                (.files[].download_path)
+              ] | unique | .[]
+            ' "${DETAIL_JSON}" > "${SNAP_DIR}/ASSET_PATHS.txt"
+
+            mapfile -t ASSET_PATHS < <(grep -v '^[[:space:]]*$' "${SNAP_DIR}/ASSET_PATHS.txt" || true)
+            for rel_path in "${ASSET_PATHS[@]}"; do
+              [[ -z "${rel_path}" ]] && continue
+              fname="$(basename "${rel_path}")"
+              echo "[${ver}] Downloading ${fname} ..."
+              curl "${CURL_ASSET_OPTS[@]}" "${API}${rel_path}" -o "${ASSET_DIR}/${fname}"
+            done
+            rm -f "${SNAP_DIR}/ASSET_PATHS.txt" "${DETAIL_JSON}"
+
+            for req in "${REQUIRED_FILES[@]}"; do
+              if [[ ! -s "${ASSET_DIR}/${req}" ]]; then
+                echo "::error::[${ver}] Missing or empty required artifact: ${req}"
+                exit 1
+              fi
+            done
+
+            # Enforce DGMail's 500 KB compressed fetch cap safety ceiling (<= 450,560 bytes / 440 KiB)
+            RULES_BYTES="$(stat -c '%s' "${ASSET_DIR}/dgmail-rules.json.gz")"
+            if (( RULES_BYTES > 450560 )); then
+              echo "::error::[${ver}] dgmail-rules.json.gz (${RULES_BYTES} bytes) exceeds 440 KiB ceiling"
               exit 1
             fi
+            gunzip -t "${ASSET_DIR}/dgmail-rules.json.gz"
+
+            # Verify cryptographic SHA-256 digests and archive structure
+            (
+              cd "${ASSET_DIR}"
+              sha256sum -c SHA256SUMS.txt
+              tar -tzf bundle.tar.gz >/dev/null
+            )
+            echo "[${ver}] All 12 release assets verified cleanly."
           done
 
-          # Enforce DGMail's 500 KB compressed fetch cap safety ceiling (<= 450,560 bytes / 440 KiB)
-          RULES_BYTES="$(stat -c '%s' "${OUT_DIR}/dgmail-rules.json.gz")"
-          if (( RULES_BYTES > 450560 )); then
-            echo "::error::dgmail-rules.json.gz (${RULES_BYTES} bytes) exceeds 440 KiB ceiling"
-            exit 1
-          fi
-          gunzip -t "${OUT_DIR}/dgmail-rules.json.gz"
-
-          # Verify cryptographic SHA-256 digests and archive structure
-          (
-            cd "${OUT_DIR}"
-            sha256sum -c SHA256SUMS.txt
-            tar -tzf bundle.tar.gz >/dev/null
-          )
-          echo "All 12 release assets verified cleanly."
-
       - name: Generate keyless OIDC build provenance attestation
-        if: steps.check.outputs.already_published == 'false'
+        if: steps.check.outputs.has_pending == 'true'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
-            ${{ runner.temp }}/release-assets/bundle.tar.gz
-            ${{ runner.temp }}/release-assets/*.gz
-            ${{ runner.temp }}/release-assets/manifest.json
-            ${{ runner.temp }}/release-assets/SHA256SUMS.txt
+            ${{ runner.temp }}/release-assets/*/assets/bundle.tar.gz
+            ${{ runner.temp }}/release-assets/*/assets/*.gz
+            ${{ runner.temp }}/release-assets/*/assets/manifest.json
+            ${{ runner.temp }}/release-assets/*/assets/SHA256SUMS.txt
 
       - name: Mint mr-vegapunk GitHub App token
-        if: steps.check.outputs.already_published == 'false'
+        if: steps.check.outputs.has_pending == 'true'
         id: vegapunk
         continue-on-error: true
         uses: actions/create-github-app-token@v3
@@ -149,40 +219,62 @@ jobs:
           permission-contents: write
 
       - name: Publish GitHub Release
-        if: steps.check.outputs.already_published == 'false'
+        if: steps.check.outputs.has_pending == 'true'
         env:
           GH_TOKEN: ${{ steps.vegapunk.outputs.token || secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          VER="${{ steps.check.outputs.version }}"
-          TITLE="${{ steps.check.outputs.title }}"
-          OUT_DIR="${RUNNER_TEMP}/release-assets"
-          NOTES_FILE="${OUT_DIR}/RELEASE_NOTES.md"
+          NEWEST_VER="${{ steps.check.outputs.newest_version }}"
 
-          # Create as draft first, upload all verified assets, then publish atomically
-          gh release create "${VER}" \
-            "${OUT_DIR}/bundle.tar.gz" \
-            "${OUT_DIR}/dgspamguard-threat-domains.rpz.gz" \
-            "${OUT_DIR}/dgspamguard-threat-domains.csv.gz" \
-            "${OUT_DIR}/dgspamguard-threat-domains.txt.gz" \
-            "${OUT_DIR}/dgspamguard-threat-urls.csv.gz" \
-            "${OUT_DIR}/dgspamguard-smtp-ips.csv.gz" \
-            "${OUT_DIR}/dgspamguard-email-domains.csv.gz" \
-            "${OUT_DIR}/dgspamguard-malware-hashes.csv.gz" \
-            "${OUT_DIR}/dgspamguard-tld-risk.csv.gz" \
-            "${OUT_DIR}/dgmail-rules.json.gz" \
-            "${OUT_DIR}/manifest.json" \
-            "${OUT_DIR}/SHA256SUMS.txt" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${TITLE}" \
-            --notes-file "${NOTES_FILE}" \
-            --draft
+          mapfile -t PENDING < <(grep -v '^[[:space:]]*$' /tmp/pending_versions.txt || true)
+          for ver in "${PENDING[@]}"; do
+            [[ -z "${ver}" ]] && continue
+            SNAP_DIR="${RUNNER_TEMP}/release-assets/${ver}"
+            ASSET_DIR="${SNAP_DIR}/assets"
+            TITLE="$(head -n 1 "${SNAP_DIR}/TITLE.txt")"
+            NOTES_FILE="${SNAP_DIR}/RELEASE_NOTES.md"
 
-          gh release edit "${VER}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --draft=false \
-            --latest
+            # Clean up any incomplete draft left behind by an interrupted prior run
+            if jq -e --arg v "${ver}" '.[] | select(.tag_name == $v and .draft == true)' /tmp/gh_releases.json >/dev/null; then
+              echo "Removing incomplete draft release for ${ver} before re-uploading ..."
+              gh release delete "${ver}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag < /dev/null || true
+            fi
+
+            echo "Publishing snapshot release ${ver} ..."
+            # Create as draft first, upload all verified assets, then publish atomically
+            gh release create "${ver}" \
+              "${ASSET_DIR}/bundle.tar.gz" \
+              "${ASSET_DIR}/dgspamguard-threat-domains.rpz.gz" \
+              "${ASSET_DIR}/dgspamguard-threat-domains.csv.gz" \
+              "${ASSET_DIR}/dgspamguard-threat-domains.txt.gz" \
+              "${ASSET_DIR}/dgspamguard-threat-urls.csv.gz" \
+              "${ASSET_DIR}/dgspamguard-smtp-ips.csv.gz" \
+              "${ASSET_DIR}/dgspamguard-email-domains.csv.gz" \
+              "${ASSET_DIR}/dgspamguard-malware-hashes.csv.gz" \
+              "${ASSET_DIR}/dgspamguard-tld-risk.csv.gz" \
+              "${ASSET_DIR}/dgmail-rules.json.gz" \
+              "${ASSET_DIR}/manifest.json" \
+              "${ASSET_DIR}/SHA256SUMS.txt" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${TITLE}" \
+              --notes-file "${NOTES_FILE}" \
+              --draft < /dev/null
+
+            if [[ "${ver}" == "${NEWEST_VER}" ]]; then
+              gh release edit "${ver}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --draft=false \
+                --latest < /dev/null
+            else
+              gh release edit "${ver}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --draft=false \
+                --latest=false < /dev/null
+            fi
+
+            rm -rf "${SNAP_DIR}"
+          done
 
       - name: Mint mr-vegapunk token for 7-day rolling retention cleanup
         id: vegapunk_prune
@@ -200,7 +292,8 @@ jobs:
         run: |
           set -euo pipefail
           CUTOFF_ISO="$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')"
-          echo "Pruning non-latest releases created before ${CUTOFF_ISO} ..."
+          CUTOFF_TAG="$(date -u -d '7 days ago' '+v%Y%m%d.%H%M')"
+          echo "Pruning non-latest releases older than ${CUTOFF_ISO} (${CUTOFF_TAG}) ..."
 
           LATEST_TAG="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName -q '.tagName' 2>/dev/null || true)"
           if [[ -z "${LATEST_TAG}" ]]; then
@@ -208,16 +301,21 @@ jobs:
             exit 0
           fi
 
-          gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            | jq -r --arg cutoff "${CUTOFF_ISO}" --arg latest "${LATEST_TAG}" '
-                .[]
-                | select(.draft == false)
-                | select(.tag_name != $latest)
-                | select((.published_at // .created_at) < $cutoff)
-                | .tag_name
-              ' \
-            | while IFS= read -r old_tag; do
-                [[ -z "${old_tag}" ]] && continue
-                echo "Deleting expired >7d snapshot release & git tag: ${old_tag}"
-                gh release delete "${old_tag}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag
-              done
+          mapfile -t EXPIRED_TAGS < <(
+            gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              | jq -r --arg cutoff "${CUTOFF_ISO}" --arg cutoff_tag "${CUTOFF_TAG}" --arg latest "${LATEST_TAG}" '
+                  .[]
+                  | select(.draft == false)
+                  | select(.tag_name != $latest)
+                  | select(
+                      ((.published_at // .created_at) < $cutoff)
+                      or ((.tag_name | test("^v[0-9]{8}\\.[0-9]{4}")) and (.tag_name[0:14] < $cutoff_tag))
+                    )
+                  | .tag_name
+                '
+          )
+          for old_tag in "${EXPIRED_TAGS[@]}"; do
+            [[ -z "${old_tag}" ]] && continue
+            echo "Deleting expired >7d snapshot release & git tag: ${old_tag}"
+            gh release delete "${old_tag}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag < /dev/null
+          done
